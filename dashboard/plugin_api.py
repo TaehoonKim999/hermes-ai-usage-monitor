@@ -22,10 +22,17 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 
 CLAUDE_CACHE_MISSING = "no cached claude usage yet — run claude once"
+CLAUDE_OAUTH_MISSING = "claude credentials not found — run 'claude' once"
+CLAUDE_TOKEN_EXPIRED = "claude oauth token expired — run 'claude' once"
 CODEX_AUTH_MISSING = "auth.json not found"
 CODEX_TOKEN_EXPIRED = "codex token expired — run 'codex login'"
 ZAI_KEY_INVALID = "zai api key invalid or missing"
 ZAI_NO_WEEKLY = "weekly quota not exposed by z.ai API"
+
+CLAUDE_OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_TOKEN_REFRESH_URL = "https://console.anthropic.com/v1/oauth/token"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CACHE_FILE = _PLUGIN_ROOT / "cache.json"
@@ -93,22 +100,105 @@ def _provider(label: str) -> Dict[str, Any]:
 
 def _fetch_claude_sync() -> Dict[str, Any]:
     provider = _provider("Claude")
-    try:
-        path = Path.home() / ".claude.json"
-        if not path.is_file():
-            provider["error"] = CLAUDE_CACHE_MISSING
-            return provider
-        data = json.loads(path.read_text(encoding="utf-8"))
-        limits = ((data.get("cachedUsageUtilization") or {}).get("utilization") or {}).get("limits") or []
-        for item in limits:
+
+    def _apply_limits(limits: Any) -> None:
+        for item in limits or []:
             if item.get("kind") == "session":
                 provider["five_hour"] = _window(item.get("percent"), item.get("resets_at"))
             elif item.get("kind") == "weekly_all":
                 provider["seven_day"] = _window(item.get("percent"), item.get("resets_at"))
+
+    # 1) ~/.claude.json cache (written by some claude code builds)
+    try:
+        path = Path.home() / ".claude.json"
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            limits = ((data.get("cachedUsageUtilization") or {}).get("utilization") or {}).get("limits") or []
+            _apply_limits(limits)
+    except Exception:
+        pass
+    if provider["five_hour"] is not None or provider["seven_day"] is not None:
+        return provider
+
+    # 2) OAuth usage API via ~/.claude/.credentials.json
+    try:
+        creds_path = Path.home() / ".claude" / ".credentials.json"
+        if not creds_path.is_file():
+            provider["error"] = CLAUDE_OAUTH_MISSING
+            return provider
+        creds = json.loads(creds_path.read_text(encoding="utf-8"))
+        oauth = creds.get("claudeAiOauth") or {}
+        access_token = oauth.get("accessToken") or ""
+        refresh_token = oauth.get("refreshToken") or ""
+        expires_at = oauth.get("expiresAt") or 0
+
+        def _expired() -> bool:
+            return bool(expires_at) and (time.time() * 1000 + 300000) >= float(expires_at)
+
+        if not access_token or _expired():
+            if not refresh_token:
+                provider["error"] = CLAUDE_TOKEN_EXPIRED if access_token else CLAUDE_OAUTH_MISSING
+                return provider
+            payload = json.dumps({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CLAUDE_OAUTH_CLIENT_ID,
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                CLAUDE_TOKEN_REFRESH_URL,
+                data=payload,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                    tokens = json.loads(response.read())
+            except urllib.error.HTTPError as exc:
+                provider["error"] = f"claude token refresh returned {exc.code}"
+                return provider
+            access_token = tokens.get("access_token") or ""
+            new_refresh = tokens.get("refresh_token") or refresh_token
+            new_expiry = tokens.get("expires_in")
+            if access_token:
+                creds["claudeAiOauth"] = {
+                    "accessToken": access_token,
+                    "refreshToken": new_refresh,
+                    "expiresAt": (time.time() + float(new_expiry)) * 1000 if new_expiry else expires_at,
+                    "scopes": oauth.get("scopes") or ["user:inference"],
+                }
+                try:
+                    creds_path.write_text(json.dumps(creds), encoding="utf-8")
+                except Exception:
+                    pass
+            else:
+                provider["error"] = CLAUDE_TOKEN_EXPIRED
+                return provider
+
+        status, body = _http_get_json(
+            CLAUDE_OAUTH_USAGE_URL,
+            {
+                "Authorization": f"Bearer {access_token}",
+                "anthropic-beta": CLAUDE_OAUTH_BETA,
+                "Accept": "application/json",
+            },
+        )
+        if status in (401, 403):
+            provider["error"] = CLAUDE_TOKEN_EXPIRED
+            return provider
+        if status != 200:
+            provider["error"] = f"claude usage api returned {status}"
+            return provider
+        payload = json.loads(body)
+        five_hour = payload.get("five_hour") or {}
+        seven_day = payload.get("seven_day") or {}
+        if five_hour.get("utilization") is not None:
+            provider["five_hour"] = _window(five_hour.get("utilization"), five_hour.get("resets_at"))
+        if seven_day.get("utilization") is not None:
+            provider["seven_day"] = _window(seven_day.get("utilization"), seven_day.get("resets_at"))
         if provider["five_hour"] is None and provider["seven_day"] is None:
-            provider["error"] = CLAUDE_CACHE_MISSING
+            provider["error"] = "no usage data from claude usage api"
     except Exception as exc:
-        provider["error"] = f"failed to read ~/.claude.json: {exc}"
+        provider["error"] = f"claude usage lookup failed: {exc}"
     return provider
 
 
@@ -162,7 +252,8 @@ def _fetch_glm_sync() -> Dict[str, Any]:
             provider["error"] = ZAI_KEY_INVALID
             return provider
         auth = json.loads(auth_path.read_text(encoding="utf-8")) or {}
-        key = (auth.get("zhipuai-coding-plan") or {}).get("key") or ""
+        zai = auth.get("zai-coding-plan") or auth.get("zhipuai-coding-plan") or {}
+        key = zai.get("key") or ""
         if not key:
             provider["error"] = ZAI_KEY_INVALID
             return provider
